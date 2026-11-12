@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  pos-qris-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pos-qris-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - JWT_SECRET=pos-qris-production-secret-key-2026
+      - PJP_WEBHOOK_SECRET=pjp-webhook-secret-key-qris-2026
+      - DATABASE_PATH=/app/server/data/pos_qris.sqlite
+    volumes:
+      - pos_data:/app/server/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  pos_data:
+    driver: local

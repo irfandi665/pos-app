@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-100 text-slate-800;
+  }
+}
+
+/* Print styles for 58mm and 80mm thermal receipts */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #thermal-receipt-area, #thermal-receipt-area * {
+    visibility: visible;
+  }
+  #thermal-receipt-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 8px;
+    background: white;
+    color: black;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 12px;
+  }
+  @page {
+    margin: 0;
+    size: auto;
+  }
+}
