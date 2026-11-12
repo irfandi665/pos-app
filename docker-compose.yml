@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   pos-qris-app:
     build:
@@ -18,11 +16,11 @@ services:
     volumes:
       - pos_data:/app/server/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 60s
 
 volumes:
   pos_data:

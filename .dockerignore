@@ -1,0 +1,17 @@
+# Dependencies (install ulang di dalam image)
+node_modules
+**/node_modules
+
+# Build outputs
+client/dist
+dist
+
+# Data & environment lokal
+server/data
+.env
+*.log
+
+# Git & dokumentasi
+.git
+.gitignore
+README.md

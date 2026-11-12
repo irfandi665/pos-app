@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install client dependencies & build frontend
 COPY client/package*.json ./client/
-RUN cd client && npm install
+RUN cd client && npm ci --no-audit --no-fund
 
 COPY client/ ./client/
 RUN cd client && npm run build
@@ -20,7 +20,7 @@ ENV PORT=3000
 
 # Install production dependencies
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # Copy server code
 COPY server/ ./server/
