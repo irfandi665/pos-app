@@ -12,12 +12,15 @@ import {
   Settings, 
   LogOut,
   Wifi,
+  WifiOff,
   Store
 } from 'lucide-react';
+import useOfflineStatus from '../useOfflineStatus';
 
 export default function Navbar({ activeTab, setActiveTab, user, onLogout, heldBillsCount = 0, openTicketsCount = 0, lowStockCount = 0 }) {
   const isOwner = user?.role === 'owner';
   const isManager = user?.role === 'manager' || isOwner;
+  const { isOnline, pendingCount } = useOfflineStatus();
 
   const navItems = [
     { id: 'pos', label: 'Kasir POS', icon: ShoppingCart, role: 'all' },
@@ -62,9 +65,25 @@ export default function Navbar({ activeTab, setActiveTab, user, onLogout, heldBi
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="font-bold text-base text-slate-900 leading-none">POS QRIS Auto-Reconcile</h1>
-                <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                  <Wifi className="w-3 h-3" /> Online Web
+                <span
+                  className={`flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full border ${
+                    isOnline
+                      ? 'text-emerald-600 bg-emerald-50 border-emerald-200'
+                      : 'text-amber-700 bg-amber-50 border-amber-300'
+                  }`}
+                  title={isOnline ? 'Terhubung ke server' : 'Mode offline: transaksi disimpan di perangkat'}
+                >
+                  {isOnline ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
+                  {isOnline ? 'Online Web' : 'Offline'}
                 </span>
+                {pendingCount > 0 && (
+                  <span
+                    className="flex items-center gap-1 text-[11px] font-bold text-white bg-amber-500 px-2 py-0.5 rounded-full"
+                    title="Transaksi menunggu sinkronisasi"
+                  >
+                    {pendingCount} antrean
+                  </span>
+                )}
               </div>
               <p className="text-[11px] text-slate-500 flex items-center gap-1 mt-0.5">
                 <Store className="w-3 h-3 text-slate-400" />

@@ -17,10 +17,13 @@ import {
   X
 } from 'lucide-react';
 import { apiRequest, formatRupiah, subscribeToQrisEvents } from '../api';
+import { createIdempotencyKey, enqueueCheckout } from '../offline';
+import useOfflineStatus from '../useOfflineStatus';
 import QrisSimulatorModal from '../components/QrisSimulatorModal';
 import ReceiptModal from '../components/ReceiptModal';
 
 export default function PosView({ user, onBillHeld }) {
+  const { isOnline, pendingCount } = useOfflineStatus({ autoSync: false });
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState(null);
@@ -61,6 +64,7 @@ export default function PosView({ user, onBillHeld }) {
   // Loading & error
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [offlineNotice, setOfflineNotice] = useState('');
 
   // Load products, categories, shift, and settings
   const fetchData = async () => {
@@ -111,6 +115,15 @@ export default function PosView({ user, onBillHeld }) {
       if (es) es.close();
     };
   }, [qrisData]);
+
+  useEffect(() => {
+    const handleSynced = () => {
+      fetchData();
+      setOfflineNotice('');
+    };
+    window.addEventListener('pos-checkout-synced', handleSynced);
+    return () => window.removeEventListener('pos-checkout-synced', handleSynced);
+  }, []);
 
   // Cart Calculations
   const subtotal = cart.reduce((acc, item) => acc + (item.selling_price * item.quantity), 0);
@@ -227,6 +240,11 @@ export default function PosView({ user, onBillHeld }) {
     setLoading(true);
     setError('');
 
+    let requestStarted = false;
+    let canQueueOffline = false;
+    let idempotencyKey = null;
+    let payload = null;
+
     try {
       let payments = [];
 
@@ -263,17 +281,28 @@ export default function PosView({ user, onBillHeld }) {
         if (cd > 0) payments.push({ method: 'card', amount: cd, card_issuer: cardIssuer, card_ref: cardRef });
       }
 
+      // QRIS requires online confirmation, so only cash/card (and split
+      // without a QRIS leg) can be accepted into the offline outbox.
+      canQueueOffline = payments.every((payment) => payment.method !== 'qris');
+
+      idempotencyKey = createIdempotencyKey();
+      payload = {
+        items: cart,
+        payment_method: paymentMethod,
+        payments,
+        discount_amount: calculatedDiscount,
+        discount_type: discountType,
+        discount_value: discountType === 'percent' ? parseFloat(discountValue || 0) : calculatedDiscount,
+        tax_rate: taxEnabled ? taxRate : 0,
+        customer_id: selectedCustomer?.id
+      };
+
+      requestStarted = true;
+
       const res = await apiRequest('/orders', {
         method: 'POST',
-        body: JSON.stringify({
-          items: cart,
-          payment_method: paymentMethod,
-          payments,
-          discount_amount: calculatedDiscount,
-          discount_type: discountType,
-          tax_rate: taxEnabled ? taxRate : 0,
-          customer_id: selectedCustomer?.id
-        })
+        headers: { 'X-Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(payload)
       });
 
       // Fetch order details for receipt
@@ -286,6 +315,26 @@ export default function PosView({ user, onBillHeld }) {
       setShowCheckout(false);
       fetchData(); // refresh stock
     } catch (err) {
+      if (requestStarted && !err.status && canQueueOffline) {
+        try {
+          await enqueueCheckout(payload, idempotencyKey);
+          clearCart();
+          setShowCheckout(false);
+          setOfflineNotice(
+            'Koneksi terputus. Transaksi disimpan aman di perangkat ini dan akan disinkronkan otomatis saat online.'
+          );
+          return;
+        } catch (queueError) {
+          setError(`Gagal menyimpan transaksi offline: ${queueError.message}`);
+          return;
+        }
+      }
+
+      if (requestStarted && !err.status) {
+        setError('Koneksi terputus. Pembayaran QRIS membutuhkan koneksi internet.');
+        return;
+      }
+
       setError(err.message || 'Gagal memproses pembayaran');
     } finally {
       setLoading(false);
@@ -302,6 +351,8 @@ export default function PosView({ user, onBillHeld }) {
         body: JSON.stringify({
           items: cart,
           discount_amount: calculatedDiscount,
+          discount_type: discountType,
+          discount_value: discountType === 'percent' ? parseFloat(discountValue || 0) : calculatedDiscount,
           tax_rate: taxEnabled ? taxRate : 0,
           customer_id: selectedCustomer?.id
         })
@@ -352,6 +403,35 @@ export default function PosView({ user, onBillHeld }) {
             <span>Shift kasir belum dibuka. Anda harus membuka shift (modal awal) sebelum memproses transaksi.</span>
           </div>
           <span className="font-bold underline cursor-pointer">Buka Shift</span>
+        </div>
+      )}
+
+      {/* Offline mode status */}
+      {!isOnline && (
+        <div className="mb-4 p-3 bg-amber-50 border border-amber-300 rounded-2xl flex items-center gap-2 text-amber-800 text-xs">
+          <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+          <span>
+            Mode offline aktif. Pembayaran tunai/kartu tetap dapat diproses dan akan disinkronkan otomatis saat koneksi kembali.
+          </span>
+        </div>
+      )}
+
+      {offlineNotice && (
+        <div className="mb-4 p-3 bg-emerald-50 border border-emerald-300 rounded-2xl flex items-center justify-between gap-2 text-emerald-800 text-xs">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{offlineNotice}</span>
+          </div>
+          <button onClick={() => setOfflineNotice('')} className="p-1 rounded-lg hover:bg-emerald-100">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {pendingCount > 0 && isOnline && (
+        <div className="mb-4 p-3 bg-sky-50 border border-sky-300 rounded-2xl flex items-center gap-2 text-sky-800 text-xs">
+          <AlertCircle className="w-4 h-4 text-sky-600 shrink-0" />
+          <span>{pendingCount} transaksi offline sedang menunggu sinkronisasi ke server.</span>
         </div>
       )}
 

@@ -23,12 +23,18 @@ function authenticateToken(req, res, next) {
   const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) {
-    return res.status(401).json({ error: 'Akses ditolak: token tidak ditemukan' });
+    return res.status(401).json({
+      error: 'Akses ditolak: token tidak ditemukan',
+      code: 'AUTH_TOKEN_MISSING'
+    });
   }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
-      return res.status(403).json({ error: 'Sesi kedaluwarsa atau token tidak valid' });
+      return res.status(403).json({
+        error: 'Sesi kedaluwarsa atau token tidak valid',
+        code: 'AUTH_TOKEN_INVALID'
+      });
     }
     req.user = user;
     next();

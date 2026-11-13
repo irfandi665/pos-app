@@ -258,4 +258,11 @@ async function seed() {
   console.log('Seeding completed successfully!');
 }
 
-seed().catch(console.error);
+if (require.main === module) {
+  seed().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { seed };

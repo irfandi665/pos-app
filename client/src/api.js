@@ -1,4 +1,6 @@
 const API_BASE = '/api';
+const AUTH_ERROR_CODES = new Set(['AUTH_TOKEN_MISSING', 'AUTH_TOKEN_INVALID']);
+export const SESSION_EXPIRED_EVENT = 'pos-session-expired';
 
 export function getToken() {
   return localStorage.getItem('pos_token') || '';
@@ -60,7 +62,21 @@ export async function apiRequest(endpoint, options = {}) {
     const errorMsg = data && data.error ? data.error : `HTTP ${res.status}: ${res.statusText}`;
     const err = new Error(errorMsg);
     err.status = res.status;
+    err.code = data && data.code;
     err.data = data;
+
+    // A missing/expired token means the cached session is no longer valid.
+    // Clear it once and notify the app shell so it returns to the login view.
+    if (AUTH_ERROR_CODES.has(err.code)) {
+      const hadSession = Boolean(getToken() || getUser());
+      setToken(null);
+      setUser(null);
+
+      if (hadSession && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT));
+      }
+    }
+
     throw err;
   }
 

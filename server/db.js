@@ -17,6 +17,11 @@ const db = new sqlite3.Database(dbPath, (err) => {
   }
 });
 
+// SQLite uses a single connection here, so transactions must be serialized.
+// Without this queue, an await inside one transaction lets another request
+// interleave its statements into the same transaction.
+let transactionQueue = Promise.resolve();
+
 // Enable WAL mode & foreign keys for performance and data integrity
 db.run('PRAGMA journal_mode = WAL;');
 db.run('PRAGMA foreign_keys = ON;');
@@ -49,7 +54,40 @@ db.runAsync = (sql, params = []) => {
   });
 };
 
+function withTransaction(work) {
+  if (typeof work !== 'function') {
+    return Promise.reject(new TypeError('withTransaction membutuhkan fungsi callback'));
+  }
+
+  const execute = async () => {
+    await db.runAsync('BEGIN IMMEDIATE');
+    try {
+      const result = await work();
+      await db.runAsync('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await db.runAsync('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('Transaction rollback error:', rollbackErr.message);
+      }
+      throw err;
+    }
+  };
+
+  const result = transactionQueue.then(execute, execute);
+  transactionQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 // Initialize Database Schema
+async function ensureColumn(table, column, definition) {
+  const columns = await db.allAsync(`PRAGMA table_info(${table})`);
+  if (!columns.some((item) => item.name === column)) {
+    await db.runAsync(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
 async function initDb() {
   await db.runAsync(`
     CREATE TABLE IF NOT EXISTS outlets (
@@ -187,9 +225,18 @@ async function initDb() {
       notes TEXT,
       void_reason TEXT,
       void_by INTEGER REFERENCES users(id),
+      idempotency_key TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       paid_at DATETIME
     );
+  `);
+
+  await ensureColumn('orders', 'idempotency_key', 'TEXT');
+
+  await db.runAsync(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key
+    ON orders(idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
   `);
 
   await db.runAsync(`
@@ -221,6 +268,62 @@ async function initDb() {
       qris_ref TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+  `);
+
+  await db.runAsync(`
+    CREATE TABLE IF NOT EXISTS order_returns (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL REFERENCES orders(id),
+      refund_amount INTEGER NOT NULL,
+      refund_method TEXT NOT NULL CHECK(refund_method IN ('cash', 'card', 'qris', 'split')),
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('completed', 'voided')),
+      approved_by INTEGER REFERENCES users(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await db.runAsync(`
+    CREATE TABLE IF NOT EXISTS order_return_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      return_id INTEGER NOT NULL REFERENCES order_returns(id),
+      order_item_id INTEGER REFERENCES order_items(id),
+      product_id INTEGER REFERENCES products(id),
+      quantity INTEGER NOT NULL,
+      unit_price INTEGER NOT NULL,
+      refund_amount INTEGER NOT NULL
+    );
+  `);
+
+  await db.runAsync(`
+    CREATE INDEX IF NOT EXISTS idx_order_returns_order
+    ON order_returns(order_id);
+  `);
+
+  await db.runAsync(`
+    CREATE INDEX IF NOT EXISTS idx_order_return_items_product
+    ON order_return_items(product_id);
+  `);
+
+  await db.runAsync(`
+    CREATE TABLE IF NOT EXISTS stock_reservations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL REFERENCES orders(id),
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      quantity INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'consumed', 'released')),
+      expires_at DATETIME NOT NULL,
+      consumed_at DATETIME,
+      released_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(order_id, product_id)
+    );
+  `);
+
+  await db.runAsync(`
+    CREATE INDEX IF NOT EXISTS idx_stock_reservations_expiry
+    ON stock_reservations(status, expires_at);
   `);
 
   await db.runAsync(`
@@ -353,5 +456,6 @@ async function initDb() {
 
 module.exports = {
   db,
-  initDb
+  initDb,
+  withTransaction
 };

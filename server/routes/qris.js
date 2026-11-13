@@ -2,22 +2,21 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const QRCode = require('qrcode');
-const { db } = require('../db');
+const { db, withTransaction } = require('../db');
 const { authenticateToken, recordAuditLog } = require('../auth');
-
-// In-memory SSE clients list for real-time notifications
-let sseClients = [];
-
-function broadcastSse(eventType, data) {
-  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
-  sseClients.forEach(client => {
-    try {
-      client.res.write(payload);
-    } catch (e) {
-      // client disconnected
-    }
-  });
-}
+const { calculateCart } = require('../services/cart');
+const { InventoryError, deductStock } = require('../services/inventory');
+const {
+  reserveStockForOrder,
+  getActiveReservations,
+  consumeReservations,
+  releaseOrderReservations
+} = require('../services/reservations');
+const {
+  addSseClient,
+  removeSseClient,
+  broadcastSse
+} = require('../services/qris-events');
 
 // GET /api/qris/events (Server-Sent Events connection)
 router.get('/events', (req, res) => {
@@ -27,15 +26,13 @@ router.get('/events', (req, res) => {
     'Connection': 'keep-alive'
   });
 
-  const clientId = Date.now() + Math.random();
-  const newClient = { id: clientId, res };
-  sseClients.push(newClient);
+  const clientId = addSseClient(res);
 
   // Send initial ping
   res.write(`event: connected\ndata: ${JSON.stringify({ message: 'SSE QRIS connected', clientId })}\n\n`);
 
   req.on('close', () => {
-    sseClients = sseClients.filter(c => c.id !== clientId);
+    removeSseClient(clientId);
   });
 });
 
@@ -82,10 +79,202 @@ function buildQrisPayload(merchantId, merchantName, city, amount, pjpRef) {
   return raw.slice(0, -4) + `6304${crcHex}`;
 }
 
+/**
+ * Settles a PENDING QRIS ledger row exactly once. The conditional UPDATE plus
+ * the serialized transaction make duplicate/concurrent webhooks idempotent and
+ * keep payment, order, and inventory updates atomic.
+ */
+async function settleQrisPayment({
+  transactionRef,
+  amount,
+  paidAt,
+  customerBank,
+  issuerRef,
+  webhookPayload,
+  req,
+  notes = 'Penjualan QRIS Dinamis Lunas'
+}) {
+  const ledger = await db.getAsync('SELECT * FROM qris_ledger WHERE transaction_ref = ?', [transactionRef]);
+  if (!ledger) return { outcome: 'NOT_FOUND' };
+
+  if (amount !== undefined && amount !== null && Number(amount) !== ledger.amount) {
+    return { outcome: 'AMOUNT_MISMATCH', ledger };
+  }
+
+  if (ledger.status === 'PAID' || ledger.status === 'SETTLED') {
+    return { outcome: 'ALREADY_PAID', ledger };
+  }
+
+  if (ledger.status !== 'PENDING') {
+    return { outcome: 'NOT_PENDING', ledger };
+  }
+
+  const paymentTime = paidAt || new Date().toISOString();
+  const rrn = issuerRef || `RRN-${Math.floor(100000000000 + Math.random() * 900000000000)}`;
+
+  const claimed = await withTransaction(async () => {
+    const updatedLedger = await db.getAsync(
+      `UPDATE qris_ledger
+       SET status = 'PAID', issuer_ref = ?, paid_at = ?, customer_bank_or_wallet = ?, webhook_payload = ?
+       WHERE transaction_ref = ? AND status = 'PENDING'
+       RETURNING id`,
+      [rrn, paymentTime, customerBank || 'QRIS Digital Payment', JSON.stringify(webhookPayload || {}), transactionRef]
+    );
+
+    if (!updatedLedger) return false;
+
+    await db.runAsync(
+      `UPDATE orders
+       SET status = 'paid', paid_at = ?
+       WHERE id = ?`,
+      [paymentTime, ledger.order_id]
+    );
+
+    await db.runAsync(
+      `INSERT INTO order_payments (order_id, payment_method, amount, tender_amount, change_amount, qris_ref)
+       VALUES (?, 'qris', ?, ?, 0, ?)`,
+      [ledger.order_id, ledger.amount, ledger.amount, transactionRef]
+    );
+
+    // Stock was already reserved (deducted) when the QR was generated.
+    // Only orders created before the reservation migration need a fallback
+    // deduction at settlement time.
+    const activeReservations = await getActiveReservations(db, ledger.order_id);
+    const reservedProductIds = new Set(activeReservations.map((row) => row.product_id));
+
+    const items = await db.allAsync('SELECT * FROM order_items WHERE order_id = ?', [ledger.order_id]);
+    for (const item of items) {
+      if (reservedProductIds.has(item.product_id)) continue;
+
+      await deductStock(db, {
+        productId: item.product_id,
+        quantity: item.quantity,
+        outletId: ledger.outlet_id,
+        userId: ledger.cashier_id,
+        referenceId: ledger.order_id,
+        notes,
+        movementType: 'sale'
+      });
+    }
+
+    await consumeReservations(db, ledger.order_id);
+    return true;
+  });
+
+  if (!claimed) {
+    return { outcome: 'ALREADY_PAID', ledger };
+  }
+
+  broadcastSse('qris_paid', {
+    transaction_ref: transactionRef,
+    order_id: ledger.order_id,
+    amount: ledger.amount,
+    status: 'PAID',
+    customer_bank: customerBank || 'QRIS Digital Payment',
+    issuer_ref: rrn,
+    paid_at: paymentTime
+  });
+
+  await recordAuditLog(
+    ledger.cashier_id,
+    'QRIS_PAID',
+    'qris_ledger',
+    transactionRef,
+    { order_id: ledger.order_id, amount: ledger.amount, rrn, bank: customerBank },
+    req
+  );
+
+  return { outcome: 'PAID', ledger, rrn, paymentTime };
+}
+
+/**
+ * Expires a PENDING QRIS ledger and releases its stock reservations exactly
+ * once. Paid ledgers are never expired, which prevents losing a real payment.
+ */
+async function expireQrisPayment({
+  transactionRef,
+  req,
+  reason = 'QRIS kedaluwarsa tanpa pembayaran'
+}) {
+  const ledger = await db.getAsync('SELECT * FROM qris_ledger WHERE transaction_ref = ?', [transactionRef]);
+  if (!ledger) return { outcome: 'NOT_FOUND' };
+
+  if (ledger.status === 'PAID' || ledger.status === 'SETTLED') {
+    return { outcome: 'ALREADY_PAID', ledger };
+  }
+  if (ledger.status === 'EXPIRED') {
+    return { outcome: 'ALREADY_EXPIRED', ledger };
+  }
+  if (ledger.status !== 'PENDING') {
+    return { outcome: 'NOT_PENDING', ledger };
+  }
+
+  const released = await withTransaction(async () => {
+    const claimed = await db.getAsync(
+      `UPDATE qris_ledger
+       SET status = 'EXPIRED'
+       WHERE transaction_ref = ? AND status = 'PENDING'
+       RETURNING id`,
+      [transactionRef]
+    );
+
+    if (!claimed) return null;
+
+    const releasedCount = await releaseOrderReservations(db, {
+      orderId: ledger.order_id,
+      outletId: ledger.outlet_id,
+      userId: ledger.cashier_id,
+      notes: reason
+    });
+
+    await db.runAsync(
+      `UPDATE orders
+       SET status = 'voided', void_reason = ?
+       WHERE id = ? AND status = 'pending'`,
+      [reason, ledger.order_id]
+    );
+
+    await recordAuditLog(
+      ledger.cashier_id,
+      'QRIS_EXPIRED',
+      'qris_ledger',
+      transactionRef,
+      { order_id: ledger.order_id, released_reservations: releasedCount, reason },
+      req
+    );
+
+    return releasedCount;
+  });
+
+  if (released === null) {
+    const current = await db.getAsync(
+      'SELECT status FROM qris_ledger WHERE transaction_ref = ?',
+      [transactionRef]
+    );
+    return { outcome: current?.status === 'EXPIRED' ? 'ALREADY_EXPIRED' : 'NOT_PENDING', ledger };
+  }
+
+  broadcastSse('qris_expired', {
+    transaction_ref: transactionRef,
+    order_id: ledger.order_id,
+    status: 'EXPIRED'
+  });
+
+  return { outcome: 'EXPIRED', ledger, released_reservations: released };
+}
+
 // POST /api/qris/generate (Generate Dynamic QRIS for POS cart)
 router.post('/generate', authenticateToken, async (req, res) => {
   try {
-    const { items, discount_amount = 0, tax_rate = 0, customer_id = null, notes = null } = req.body;
+    const {
+      items,
+      discount_amount = 0,
+      discount_type = 'nominal',
+      discount_value,
+      tax_rate = 0,
+      customer_id = null,
+      notes = null
+    } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'Keranjang belanja tidak boleh kosong' });
@@ -100,42 +289,52 @@ router.post('/generate', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Kasir belum membuka shift aktif' });
     }
 
-    // Calculate totals
-    let subtotal = 0;
-    const orderItems = [];
-
+    const uniqueProductIds = [];
     for (const item of items) {
-      const prod = await db.getAsync('SELECT * FROM products WHERE id = ? AND is_active = 1', [item.product_id]);
-      if (!prod) return res.status(400).json({ error: `Produk ID ${item.product_id} tidak valid` });
+      const productId = Number(item.product_id);
+      if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ error: `Produk ID ${item.product_id} tidak valid` });
+      }
+      if (!uniqueProductIds.includes(productId)) uniqueProductIds.push(productId);
+    }
 
-      const qty = parseInt(item.quantity, 10);
-      if (prod.stock < qty) {
-        return res.status(400).json({ error: `Stok "${prod.name}" tidak mencukupi (Tersedia: ${prod.stock})` });
+    const placeholders = uniqueProductIds.map(() => '?').join(',');
+    const products = await db.allAsync(
+      `SELECT * FROM products WHERE id IN (${placeholders}) AND is_active = 1`,
+      uniqueProductIds
+    );
+    const productMap = new Map(products.map((product) => [product.id, product]));
+
+    const pricedItems = [];
+    for (const item of items) {
+      const product = productMap.get(Number(item.product_id));
+      if (!product) {
+        return res.status(400).json({ error: `Produk ID ${item.product_id} tidak valid` });
       }
 
-      const lineTotal = prod.selling_price * qty;
-      subtotal += lineTotal;
-      orderItems.push({
-        product_id: prod.id,
-        name: prod.name,
-        sku: prod.sku,
-        unit_price: prod.selling_price,
-        cost_price: prod.cost_price,
-        quantity: qty,
-        subtotal: lineTotal,
-        total: lineTotal,
-        stock: prod.stock
+      pricedItems.push({
+        product_id: product.id,
+        name: product.name,
+        sku: product.sku,
+        unit_price: product.selling_price,
+        cost_price: product.cost_price,
+        quantity: item.quantity,
+        stock: product.stock
       });
     }
 
-    const disc = parseInt(discount_amount || 0, 10);
-    const afterDisc = Math.max(0, subtotal - disc);
-    const tax = Math.round(afterDisc * (parseFloat(tax_rate || 0) / 100));
-    const totalAmount = afterDisc + tax;
+    const cart = calculateCart(pricedItems, {
+      discount_amount,
+      discount_type,
+      discount_value,
+      tax_rate,
+      enforce_stock: true
+    });
+    const totalAmount = cart.total_amount;
 
     // Generate unique order ID and PJP Reference ID
     const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const rand = Math.floor(1000 + Math.random() * 9000);
+    const rand = crypto.randomInt(100000, 1000000);
     const orderId = `ORD-${ymd}-${rand}`;
     const pjpRef = `QRIS-PJP-${ymd}-${rand}`;
 
@@ -164,60 +363,84 @@ router.post('/generate', authenticateToken, async (req, res) => {
       }
     });
 
-    // Create pending order
-    await db.runAsync(
-      `INSERT INTO orders (id, outlet_id, cashier_id, customer_id, shift_id, status, subtotal, discount_amount, tax_rate, tax_amount, total_amount, payment_method, notes) 
-       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, 'qris', ?)`,
-      [
-        orderId,
-        req.user.outlet_id || 1,
-        req.user.id,
-        customer_id || null,
-        activeShift.id,
-        subtotal,
-        disc,
-        parseFloat(tax_rate || 0),
-        tax,
-        totalAmount,
-        notes || null
-      ]
-    );
+    const outletId = req.user.outlet_id || 1;
 
-    // Insert pending order items (stock deducted only upon paid webhook)
-    for (const oi of orderItems) {
+    await withTransaction(async () => {
       await db.runAsync(
-        `INSERT INTO order_items (order_id, product_id, product_name, sku, unit_price, cost_price, quantity, subtotal, discount, total) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-        [orderId, oi.product_id, oi.name, oi.sku, oi.unit_price, oi.cost_price, oi.quantity, oi.subtotal, oi.total]
+        `INSERT INTO orders (id, outlet_id, cashier_id, customer_id, shift_id, status, subtotal, discount_amount, discount_type, tax_rate, tax_amount, total_amount, payment_method, notes)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, 'qris', ?)`,
+        [
+          orderId,
+          outletId,
+          req.user.id,
+          customer_id || null,
+          activeShift.id,
+          cart.subtotal,
+          cart.discount_amount,
+          cart.discount_type,
+          cart.tax_rate,
+          cart.tax_amount,
+          totalAmount,
+          notes || null
+        ]
       );
-    }
 
-    // Insert into QRIS Ledger
-    await db.runAsync(
-      `INSERT INTO qris_ledger (order_id, transaction_ref, qr_type, qr_string, amount, mdr_percent, mdr_amount, net_amount, status, expires_at, outlet_id, cashier_id) 
-       VALUES (?, ?, 'dynamic', ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
-      [
+      // Insert pending order items (stock deducted only upon paid webhook)
+      for (const item of cart.items) {
+        await db.runAsync(
+          `INSERT INTO order_items (order_id, product_id, product_name, sku, unit_price, cost_price, quantity, subtotal, discount, total)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+          [
+            orderId,
+            item.product_id,
+            item.name,
+            item.sku,
+            item.unit_price,
+            item.cost_price,
+            item.quantity,
+            item.subtotal,
+            item.total
+          ]
+        );
+      }
+
+      // Reserve stock now so two simultaneous QRIS generations cannot sell
+      // the same units. The reservation is consumed on PAID and released on
+      // expiry by the sweeper.
+      await reserveStockForOrder(db, {
         orderId,
-        pjpRef,
-        qrString,
-        totalAmount,
-        mdrRate,
-        mdrAmount,
-        netAmount,
-        expiresAt.toISOString(),
-        req.user.outlet_id || 1,
-        req.user.id
-      ]
-    );
+        items: cart.items,
+        outletId,
+        userId: req.user.id,
+        expiresAt: expiresAt.toISOString()
+      });
 
-    await recordAuditLog(
-      req.user.id,
-      'GENERATE_DYNAMIC_QRIS',
-      'qris_ledger',
-      pjpRef,
-      { orderId, amount: totalAmount, expiresAt: expiresAt.toISOString() },
-      req
-    );
+      await db.runAsync(
+        `INSERT INTO qris_ledger (order_id, transaction_ref, qr_type, qr_string, amount, mdr_percent, mdr_amount, net_amount, status, expires_at, outlet_id, cashier_id)
+         VALUES (?, ?, 'dynamic', ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
+        [
+          orderId,
+          pjpRef,
+          qrString,
+          totalAmount,
+          mdrRate,
+          mdrAmount,
+          netAmount,
+          expiresAt.toISOString(),
+          outletId,
+          req.user.id
+        ]
+      );
+
+      await recordAuditLog(
+        req.user.id,
+        'GENERATE_DYNAMIC_QRIS',
+        'qris_ledger',
+        pjpRef,
+        { orderId, amount: totalAmount, expiresAt: expiresAt.toISOString() },
+        req
+      );
+    });
 
     res.json({
       success: true,
@@ -225,6 +448,9 @@ router.post('/generate', authenticateToken, async (req, res) => {
       transaction_ref: pjpRef,
       qr_string: qrString,
       qr_data_url: qrDataUrl,
+      subtotal: cart.subtotal,
+      discount_amount: cart.discount_amount,
+      tax_amount: cart.tax_amount,
       amount: totalAmount,
       expires_at: expiresAt.toISOString(),
       expires_in_seconds: 300,
@@ -233,6 +459,9 @@ router.post('/generate', authenticateToken, async (req, res) => {
       net_amount: netAmount
     });
   } catch (err) {
+    if (err && err.statusCode && err.statusCode < 500) {
+      return res.status(err.statusCode).json({ error: err.message, code: err.code });
+    }
     console.error('Generate QRIS error:', err);
     res.status(500).json({ error: err.message });
   }
@@ -274,6 +503,12 @@ router.post('/webhook', async (req, res) => {
       return res.status(404).json({ error: 'Transaksi QRIS tidak ditemukan di ledger' });
     }
 
+    if (status === 'PAID' && amount !== undefined && amount !== null && Number(amount) !== ledger.amount) {
+      return res.status(400).json({
+        error: `Nominal webhook (${amount}) tidak sesuai dengan nominal ledger (${ledger.amount})`
+      });
+    }
+
     // Idempotency check: If already PAID, acknowledge without re-deducting stock
     if (ledger.status === 'PAID') {
       return res.json({
@@ -287,92 +522,77 @@ router.post('/webhook', async (req, res) => {
     const rrn = issuer_ref || `RRN-${Math.floor(100000000000 + Math.random() * 900000000000)}`;
 
     if (status === 'PAID') {
-      // 1. Update QRIS Ledger to PAID
-      await db.runAsync(
-        `UPDATE qris_ledger 
-         SET status = 'PAID', issuer_ref = ?, paid_at = ?, customer_bank_or_wallet = ?, webhook_payload = ? 
-         WHERE transaction_ref = ?`,
-        [rrn, paymentTime, customer_bank || 'QRIS Digital Payment', JSON.stringify(req.body), transaction_ref]
-      );
-
-      // 2. Update Order to PAID
-      await db.runAsync(
-        `UPDATE orders 
-         SET status = 'paid', paid_at = ? 
-         WHERE id = ?`,
-        [paymentTime, ledger.order_id]
-      );
-
-      // 3. Insert into order_payments
-      await db.runAsync(
-        `INSERT INTO order_payments (order_id, payment_method, amount, tender_amount, change_amount, qris_ref) 
-         VALUES (?, 'qris', ?, ?, 0, ?)`,
-        [ledger.order_id, ledger.amount, ledger.amount, transaction_ref]
-      );
-
-      // 4. Deduct inventory stock & record stock movement
-      const items = await db.allAsync('SELECT * FROM order_items WHERE order_id = ?', [ledger.order_id]);
-      for (const it of items) {
-        const prod = await db.getAsync('SELECT stock FROM products WHERE id = ?', [it.product_id]);
-        if (prod) {
-          const newStock = prod.stock - it.quantity;
-          await db.runAsync('UPDATE products SET stock = ? WHERE id = ?', [newStock, it.product_id]);
-
-          await db.runAsync(
-            `INSERT INTO stock_movements (product_id, outlet_id, change_qty, previous_stock, current_stock, movement_type, reference_id, notes, user_id) 
-             VALUES (?, ?, ?, ?, ?, 'sale', ?, 'Penjualan QRIS Dinamis Lunas', ?)`,
-            [it.product_id, ledger.outlet_id, -it.quantity, prod.stock, newStock, ledger.order_id, ledger.cashier_id]
-          );
-        }
-      }
-
-      // 5. Broadcast SSE event immediately to all active screens (< 1 second response!)
-      broadcastSse('qris_paid', {
-        transaction_ref,
-        order_id: ledger.order_id,
-        amount: ledger.amount,
-        status: 'PAID',
-        customer_bank: customer_bank || 'QRIS Digital Payment',
-        issuer_ref: rrn,
-        paid_at: paymentTime
+      const result = await settleQrisPayment({
+        transactionRef: transaction_ref,
+        amount,
+        paidAt: paid_at,
+        customerBank: customer_bank,
+        issuerRef: issuer_ref,
+        webhookPayload: req.body,
+        req
       });
 
-      await recordAuditLog(
-        ledger.cashier_id,
-        'QRIS_WEBHOOK_PAID',
-        'qris_ledger',
-        transaction_ref,
-        { order_id: ledger.order_id, amount: ledger.amount, rrn, bank: customer_bank },
-        req
-      );
+      if (result.outcome === 'NOT_FOUND') {
+        return res.status(404).json({ error: 'Transaksi QRIS tidak ditemukan di ledger' });
+      }
+      if (result.outcome === 'AMOUNT_MISMATCH') {
+        return res.status(400).json({
+          error: `Nominal webhook (${amount}) tidak sesuai dengan nominal ledger (${result.ledger.amount})`
+        });
+      }
+      if (result.outcome === 'ALREADY_PAID') {
+        return res.json({
+          success: true,
+          message: 'Idempoten: Webhook notifikasi ganda telah diabaikan (sudah lunas)',
+          status: 'PAID'
+        });
+      }
+      if (result.outcome === 'NOT_PENDING') {
+        return res.status(409).json({
+          error: `QRIS tidak dapat diselesaikan karena berstatus ${result.ledger.status}. Lakukan rekonsiliasi/refund manual.`,
+          code: 'QRIS_NOT_PENDING',
+          status: result.ledger.status
+        });
+      }
 
       return res.json({
         success: true,
         message: 'Pembayaran QRIS berhasil diproses dan diverifikasi',
         status: 'PAID',
-        rrn
+        rrn: result.rrn
       });
     } else if (status === 'EXPIRED') {
-      await db.runAsync(
-        `UPDATE qris_ledger SET status = 'EXPIRED' WHERE transaction_ref = ?`,
-        [transaction_ref]
-      );
-      await db.runAsync(
-        `UPDATE orders SET status = 'voided', void_reason = 'QRIS kedaluwarsa tanpa pembayaran' WHERE id = ?`,
-        [ledger.order_id]
-      );
+      const result = await expireQrisPayment({ transactionRef: transaction_ref, req });
 
-      broadcastSse('qris_expired', {
-        transaction_ref,
-        order_id: ledger.order_id,
-        status: 'EXPIRED'
+      if (result.outcome === 'NOT_FOUND') {
+        return res.status(404).json({ error: 'Transaksi QRIS tidak ditemukan di ledger' });
+      }
+      if (result.outcome === 'ALREADY_PAID') {
+        return res.json({
+          success: true,
+          message: 'Transaksi sudah lunas; notifikasi EXPIRED diabaikan',
+          status: 'PAID'
+        });
+      }
+      if (result.outcome === 'NOT_PENDING') {
+        return res.status(409).json({
+          error: `Status QRIS ${result.ledger.status} tidak dapat diubah menjadi EXPIRED`,
+          code: 'QRIS_NOT_PENDING'
+        });
+      }
+
+      return res.json({
+        success: true,
+        status: 'EXPIRED',
+        released_reservations: result.released_reservations
       });
-
-      return res.json({ success: true, status: 'EXPIRED' });
     }
 
     res.json({ success: true, message: 'Webhook diterima' });
   } catch (err) {
+    if (err instanceof InventoryError || (err && err.statusCode && err.statusCode < 500)) {
+      return res.status(err.statusCode || 400).json({ error: err.message, code: err.code });
+    }
     console.error('Webhook processing error:', err);
     res.status(500).json({ error: err.message });
   }
@@ -417,6 +637,14 @@ router.post('/simulate-pay', async (req, res) => {
       return res.json({ success: true, message: 'Transaksi ini sudah lunas', status: 'PAID' });
     }
 
+    if (ledger.status !== 'PENDING') {
+      return res.status(409).json({
+        error: `QRIS berstatus ${ledger.status} dan tidak dapat dibayar. Buat QR baru atau lakukan refund manual.`,
+        code: 'QRIS_NOT_PENDING',
+        status: ledger.status
+      });
+    }
+
     const rrn = `RRN-${Math.floor(100000000000 + Math.random() * 900000000000)}`;
     const secret = process.env.PJP_WEBHOOK_SECRET || 'pjp-webhook-secret-key-qris-2026';
     const signature = crypto
@@ -439,60 +667,44 @@ router.post('/simulate-pay', async (req, res) => {
       socket: { remoteAddress: '127.0.0.1' }
     };
 
-    // Forward to webhook logic
-    const paymentTime = new Date().toISOString();
-
-    await db.runAsync(
-      `UPDATE qris_ledger 
-       SET status = 'PAID', issuer_ref = ?, paid_at = ?, customer_bank_or_wallet = ?, webhook_payload = ? 
-       WHERE transaction_ref = ?`,
-      [rrn, paymentTime, customer_bank, JSON.stringify(webhookReq.body), transaction_ref]
-    );
-
-    await db.runAsync(
-      `UPDATE orders SET status = 'paid', paid_at = ? WHERE id = ?`,
-      [paymentTime, ledger.order_id]
-    );
-
-    await db.runAsync(
-      `INSERT INTO order_payments (order_id, payment_method, amount, tender_amount, change_amount, qris_ref) 
-       VALUES (?, 'qris', ?, ?, 0, ?)`,
-      [ledger.order_id, ledger.amount, ledger.amount, transaction_ref]
-    );
-
-    // Deduct stock
-    const items = await db.allAsync('SELECT * FROM order_items WHERE order_id = ?', [ledger.order_id]);
-    for (const it of items) {
-      const prod = await db.getAsync('SELECT stock FROM products WHERE id = ?', [it.product_id]);
-      if (prod) {
-        const newStock = prod.stock - it.quantity;
-        await db.runAsync('UPDATE products SET stock = ? WHERE id = ?', [newStock, it.product_id]);
-
-        await db.runAsync(
-          `INSERT INTO stock_movements (product_id, outlet_id, change_qty, previous_stock, current_stock, movement_type, reference_id, notes, user_id) 
-           VALUES (?, ?, ?, ?, ?, 'sale', ?, 'Penjualan QRIS Dinamis (Simulasi)', ?)`,
-          [it.product_id, ledger.outlet_id, -it.quantity, prod.stock, newStock, ledger.order_id, ledger.cashier_id]
-        );
-      }
-    }
-
-    broadcastSse('qris_paid', {
-      transaction_ref,
-      order_id: ledger.order_id,
+    const result = await settleQrisPayment({
+      transactionRef: transaction_ref,
       amount: ledger.amount,
-      status: 'PAID',
-      customer_bank,
-      issuer_ref: rrn,
-      paid_at: paymentTime
+      paidAt: new Date().toISOString(),
+      customerBank: customer_bank,
+      issuerRef: rrn,
+      webhookPayload: webhookReq.body,
+      req,
+      notes: 'Penjualan QRIS Dinamis (Simulasi)'
     });
+
+    if (result.outcome === 'NOT_FOUND') {
+      return res.status(404).json({ error: 'Transaksi QRIS tidak ditemukan' });
+    }
+    if (result.outcome === 'AMOUNT_MISMATCH') {
+      return res.status(400).json({ error: 'Nominal simulasi tidak sesuai dengan ledger' });
+    }
+    if (result.outcome === 'ALREADY_PAID') {
+      return res.json({ success: true, message: 'Transaksi ini sudah lunas', status: 'PAID' });
+    }
+    if (result.outcome === 'NOT_PENDING') {
+      return res.status(409).json({
+        error: `QRIS berstatus ${result.ledger.status} dan tidak dapat diselesaikan`,
+        code: 'QRIS_NOT_PENDING',
+        status: result.ledger.status
+      });
+    }
 
     res.json({
       success: true,
       message: `Simulasi pembayaran sukses via ${customer_bank}! Status otomatis berubah menjadi LUNAS.`,
       status: 'PAID',
-      issuer_ref: rrn
+      issuer_ref: result.rrn
     });
   } catch (err) {
+    if (err instanceof InventoryError || (err && err.statusCode && err.statusCode < 500)) {
+      return res.status(err.statusCode || 400).json({ error: err.message, code: err.code });
+    }
     res.status(500).json({ error: err.message });
   }
 });
