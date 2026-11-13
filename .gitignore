@@ -11,3 +11,9 @@ server/dist/
 # Environment & logs
 .env
 *.log
+
+# Test artifacts
+tests/e2e/.tmp/
+test-results/playwright-artifacts/
+test-results/playwright-report/
+test-results/coverage/
