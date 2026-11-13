@@ -39,6 +39,11 @@ async function seedDatabase(db) {
       [outletId, username, passwordHash, fullName, role, pinHash]
     );
     userIds[role] = result.lastID;
+
+    await db.runAsync(
+      `INSERT INTO user_outlets (user_id, outlet_id, is_primary) VALUES (?, ?, 1)`,
+      [result.lastID, outletId]
+    );
   }
 
   const settings = [

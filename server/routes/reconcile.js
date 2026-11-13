@@ -2,12 +2,14 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const { db } = require('../db');
-const { authenticateToken, requireRole, verifyManagerPin, recordAuditLog } = require('../auth');
+const { authenticateToken, verifyManagerPin, recordAuditLog } = require('../auth');
+const { requirePermission } = require('../services/rbac');
+const { resolveOutletContext } = require('../services/outlets');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 // GET /api/reconcile/ledger (QRIS Ledger list with filters)
-router.get('/ledger', authenticateToken, async (req, res) => {
+router.get('/ledger', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const { start_date, end_date, status, search, limit = 100 } = req.query;
 
@@ -18,9 +20,9 @@ router.get('/ledger', authenticateToken, async (req, res) => {
       LEFT JOIN orders o ON ql.order_id = o.id 
       LEFT JOIN users u ON ql.cashier_id = u.id 
       LEFT JOIN outlets out ON ql.outlet_id = out.id 
-      WHERE 1=1
+      WHERE ql.outlet_id = ?
     `;
-    const params = [];
+    const params = [req.outletId];
 
     if (start_date) {
       query += ` AND date(ql.created_at) >= date(?)`;
@@ -56,7 +58,8 @@ router.get('/ledger', authenticateToken, async (req, res) => {
         SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as pending_count,
         SUM(CASE WHEN status = 'DISPUTED' THEN 1 ELSE 0 END) as disputed_count
       FROM qris_ledger
-    `);
+      WHERE outlet_id = ?
+    `, [req.outletId]);
 
     res.json({ ledger, summary });
   } catch (err) {
@@ -259,7 +262,7 @@ async function runAutoReconciliation(settlementRecords, batchMeta, userId) {
 }
 
 // POST /api/reconcile/upload-settlement (Upload CSV settlement file)
-router.post('/upload-settlement', authenticateToken, requireRole(['manager', 'owner']), upload.single('settlement_file'), async (req, res) => {
+router.post('/upload-settlement', authenticateToken, requirePermission('reconcile.manage'), upload.single('settlement_file'), async (req, res) => {
   try {
     let rows = [];
     const fileName = req.file ? req.file.originalname : 'settlement.csv';
@@ -310,7 +313,7 @@ router.post('/upload-settlement', authenticateToken, requireRole(['manager', 'ow
 });
 
 // POST /api/reconcile/simulate-auto-settlement (One-click simulated PJP Settlement fetch & reconciliation)
-router.post('/simulate-auto-settlement', authenticateToken, requireRole(['manager', 'owner']), async (req, res) => {
+router.post('/simulate-auto-settlement', authenticateToken, requirePermission('reconcile.manage'), async (req, res) => {
   try {
     // Generate simulated settlement rows matching today's and yesterday's QRIS transactions
     const paidQris = await db.allAsync(
@@ -371,7 +374,7 @@ router.post('/simulate-auto-settlement', authenticateToken, requireRole(['manage
 });
 
 // GET /api/reconcile/tickets (Discrepancy Action Queue)
-router.get('/tickets', authenticateToken, async (req, res) => {
+router.get('/tickets', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const { status } = req.query;
     let query = `
@@ -382,9 +385,9 @@ router.get('/tickets', authenticateToken, async (req, res) => {
       JOIN settlement_items si ON rt.settlement_item_id = si.id 
       LEFT JOIN qris_ledger ql ON rt.qris_ledger_id = ql.id 
       LEFT JOIN users u ON rt.assigned_to = u.id 
-      WHERE 1=1
+      WHERE (ql.outlet_id = ? OR ql.id IS NULL)
     `;
-    const params = [];
+    const params = [req.outletId];
 
     if (status && status !== 'ALL') {
       query += ` AND rt.status = ?`;
@@ -400,7 +403,7 @@ router.get('/tickets', authenticateToken, async (req, res) => {
 });
 
 // PUT /api/reconcile/tickets/:id (Update Discrepancy Ticket status & resolution notes with Manager PIN)
-router.put('/tickets/:id', authenticateToken, requireRole(['manager', 'owner']), verifyManagerPin, async (req, res) => {
+router.put('/tickets/:id', authenticateToken, requirePermission('reconcile.manage'), verifyManagerPin, async (req, res) => {
   try {
     const id = req.params.id;
     const { status, resolution, notes } = req.body;
@@ -433,7 +436,7 @@ router.put('/tickets/:id', authenticateToken, requireRole(['manager', 'owner']),
 });
 
 // GET /api/reconcile/export-csv (Export QRIS Ledger to CSV for Accountant)
-router.get('/export-csv', authenticateToken, requireRole(['manager', 'owner']), async (req, res) => {
+router.get('/export-csv', authenticateToken, requirePermission('reconcile.manage'), async (req, res) => {
   try {
     const records = await db.allAsync(`
       SELECT 

@@ -34,6 +34,9 @@ function createApp() {
   app.use('/api/customers', require('./routes/customers'));
   app.use('/api/settings', require('./routes/settings'));
   app.use('/api/audit', require('./routes/audit'));
+  app.use('/api/outlets', require('./routes/outlets'));
+  app.use('/api/users', require('./routes/users'));
+  app.use('/api/roles', require('./routes/roles'));
 
   // Unknown API routes must return JSON, never the SPA shell.
   app.use('/api', (req, res) => {

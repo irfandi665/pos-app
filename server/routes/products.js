@@ -1,19 +1,21 @@
 const express = require('express');
 const router = express.Router();
 const { db } = require('../db');
-const { authenticateToken, requireRole, verifyManagerPin, recordAuditLog } = require('../auth');
+const { authenticateToken, verifyManagerPin, recordAuditLog } = require('../auth');
+const { requirePermission } = require('../services/rbac');
+const { resolveOutletContext } = require('../services/outlets');
 
 // GET /api/products
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const { category_id, search, low_stock } = req.query;
     let query = `
       SELECT p.*, c.name as category_name, c.color as category_color 
       FROM products p 
       LEFT JOIN categories c ON p.category_id = c.id 
-      WHERE p.is_active = 1
+      WHERE p.is_active = 1 AND p.outlet_id = ?
     `;
-    const params = [];
+    const params = [req.outletId];
 
     if (category_id) {
       query += ` AND p.category_id = ?`;
@@ -38,14 +40,16 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 // GET /api/categories
-router.get('/categories/list', authenticateToken, async (req, res) => {
+router.get('/categories/list', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const categories = await db.allAsync(
       `SELECT c.*, COUNT(p.id) as product_count 
        FROM categories c 
        LEFT JOIN products p ON c.id = p.category_id AND p.is_active = 1 
+       WHERE c.outlet_id = ?
        GROUP BY c.id 
-       ORDER BY c.name ASC`
+       ORDER BY c.name ASC`,
+      [req.outletId]
     );
     res.json({ categories });
   } catch (err) {
@@ -54,14 +58,14 @@ router.get('/categories/list', authenticateToken, async (req, res) => {
 });
 
 // POST /api/categories
-router.post('/categories', authenticateToken, requireRole(['manager', 'owner']), async (req, res) => {
+router.post('/categories', authenticateToken, requirePermission('products.manage'), resolveOutletContext, async (req, res) => {
   try {
     const { name, color, icon } = req.body;
     if (!name) return res.status(400).json({ error: 'Nama kategori wajib diisi' });
 
     const result = await db.runAsync(
       `INSERT INTO categories (outlet_id, name, color, icon) VALUES (?, ?, ?, ?)`,
-      [req.user.outlet_id || 1, name, color || '#4F46E5', icon || 'Package']
+      [req.outletId, name, color || '#4F46E5', icon || 'Package']
     );
 
     res.json({ id: result.lastID, name, message: 'Kategori berhasil ditambahkan' });
@@ -71,7 +75,7 @@ router.post('/categories', authenticateToken, requireRole(['manager', 'owner']),
 });
 
 // POST /api/products
-router.post('/', authenticateToken, requireRole(['manager', 'owner']), async (req, res) => {
+router.post('/', authenticateToken, requirePermission('products.manage'), resolveOutletContext, async (req, res) => {
   try {
     const { category_id, name, sku, barcode, unit, cost_price, selling_price, stock, min_stock, image_url } = req.body;
     if (!name || !sku || selling_price === undefined) {
@@ -82,7 +86,7 @@ router.post('/', authenticateToken, requireRole(['manager', 'owner']), async (re
       `INSERT INTO products (outlet_id, category_id, name, sku, barcode, unit, cost_price, selling_price, stock, min_stock, image_url) 
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        req.user.outlet_id || 1,
+        req.outletId,
         category_id || null,
         name,
         sku,
@@ -103,7 +107,7 @@ router.post('/', authenticateToken, requireRole(['manager', 'owner']), async (re
       await db.runAsync(
         `INSERT INTO stock_movements (product_id, outlet_id, change_qty, previous_stock, current_stock, movement_type, notes, user_id) 
          VALUES (?, ?, ?, 0, ?, 'stock_in', 'Penambahan produk baru', ?)`,
-        [newProdId, req.user.outlet_id || 1, initialStock, initialStock, req.user.id]
+        [newProdId, req.outletId, initialStock, initialStock, req.user.id]
       );
     }
 
@@ -119,13 +123,16 @@ router.post('/', authenticateToken, requireRole(['manager', 'owner']), async (re
 });
 
 // PUT /api/products/:id
-router.put('/:id', authenticateToken, requireRole(['manager', 'owner']), async (req, res) => {
+router.put('/:id', authenticateToken, requirePermission('products.manage'), resolveOutletContext, async (req, res) => {
   try {
     const id = req.params.id;
     const { category_id, name, sku, barcode, unit, cost_price, selling_price, stock, min_stock, image_url } = req.body;
 
     const existing = await db.getAsync('SELECT * FROM products WHERE id = ?', [id]);
     if (!existing) return res.status(404).json({ error: 'Produk tidak ditemukan' });
+    if (existing.outlet_id && existing.outlet_id !== req.outletId) {
+      return res.status(403).json({ error: 'Produk milik outlet lain', code: 'OUTLET_FORBIDDEN' });
+    }
 
     // If price changed, requires manager PIN check or audit
     const newCost = parseInt(cost_price ?? existing.cost_price, 10);
@@ -156,7 +163,7 @@ router.put('/:id', authenticateToken, requireRole(['manager', 'owner']), async (
       await db.runAsync(
         `INSERT INTO stock_movements (product_id, outlet_id, change_qty, previous_stock, current_stock, movement_type, notes, user_id) 
          VALUES (?, ?, ?, ?, ?, 'opname_adjustment', 'Penyesuaian manual edit produk', ?)`,
-        [id, req.user.outlet_id || 1, diff, existing.stock, newStock, req.user.id]
+        [id, req.outletId, diff, existing.stock, newStock, req.user.id]
       );
     }
 
@@ -169,9 +176,14 @@ router.put('/:id', authenticateToken, requireRole(['manager', 'owner']), async (
 });
 
 // DELETE /api/products/:id
-router.delete('/:id', authenticateToken, requireRole(['manager', 'owner']), verifyManagerPin, async (req, res) => {
+router.delete('/:id', authenticateToken, requirePermission('products.manage'), verifyManagerPin, resolveOutletContext, async (req, res) => {
   try {
     const id = req.params.id;
+    const existing = await db.getAsync('SELECT id, outlet_id FROM products WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Produk tidak ditemukan' });
+    if (existing.outlet_id && existing.outlet_id !== req.outletId) {
+      return res.status(403).json({ error: 'Produk milik outlet lain', code: 'OUTLET_FORBIDDEN' });
+    }
     await db.runAsync('UPDATE products SET is_active = 0 WHERE id = ?', [id]);
     await recordAuditLog(req.user.id, 'DEACTIVATE_PRODUCT', 'products', id, 'Produk dinonaktifkan dengan PIN manajer', req);
     res.json({ message: 'Produk berhasil dinonaktifkan' });
@@ -181,7 +193,7 @@ router.delete('/:id', authenticateToken, requireRole(['manager', 'owner']), veri
 });
 
 // GET /api/products/movements (Stock movements audit log)
-router.get('/history/movements', authenticateToken, async (req, res) => {
+router.get('/history/movements', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const { product_id, limit = 50 } = req.query;
     let query = `
@@ -189,11 +201,12 @@ router.get('/history/movements', authenticateToken, async (req, res) => {
       FROM stock_movements sm 
       JOIN products p ON sm.product_id = p.id 
       LEFT JOIN users u ON sm.user_id = u.id 
+      WHERE sm.outlet_id = ?
     `;
-    const params = [];
+    const params = [req.outletId];
 
     if (product_id) {
-      query += ` WHERE sm.product_id = ?`;
+      query += ` AND sm.product_id = ?`;
       params.push(product_id);
     }
 
@@ -208,7 +221,7 @@ router.get('/history/movements', authenticateToken, async (req, res) => {
 });
 
 // POST /api/products/opname (Stock Opname submit with Manager PIN verification)
-router.post('/opname', authenticateToken, requireRole(['manager', 'owner']), verifyManagerPin, async (req, res) => {
+router.post('/opname', authenticateToken, requirePermission('stock.opname'), verifyManagerPin, resolveOutletContext, async (req, res) => {
   try {
     const { items, notes } = req.body;
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -221,13 +234,14 @@ router.post('/opname', authenticateToken, requireRole(['manager', 'owner']), ver
     const opnameRes = await db.runAsync(
       `INSERT INTO stock_opnames (outlet_id, user_id, manager_id, total_items_checked, notes) 
        VALUES (?, ?, ?, ?, ?)`,
-      [req.user.outlet_id || 1, req.user.id, req.manager.id, items.length, notes || 'Sesi stock opname']
+      [req.outletId, req.user.id, req.manager.id, items.length, notes || 'Sesi stock opname']
     );
     const opnameId = opnameRes.lastID;
 
     for (const item of items) {
       const prod = await db.getAsync('SELECT * FROM products WHERE id = ?', [item.product_id]);
       if (!prod) continue;
+      if (prod.outlet_id && prod.outlet_id !== req.outletId) continue;
 
       const physicalQty = parseInt(item.physical_qty, 10);
       const systemQty = prod.stock;
@@ -253,7 +267,7 @@ router.post('/opname', authenticateToken, requireRole(['manager', 'owner']), ver
            VALUES (?, ?, ?, ?, ?, 'opname_adjustment', ?, ?, ?)`,
           [
             prod.id,
-            req.user.outlet_id || 1,
+            req.outletId,
             discrepancyQty,
             systemQty,
             physicalQty,
@@ -296,14 +310,16 @@ router.post('/opname', authenticateToken, requireRole(['manager', 'owner']), ver
 });
 
 // GET /api/products/opnames/list
-router.get('/opnames/list', authenticateToken, async (req, res) => {
+router.get('/opnames/list', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const opnames = await db.allAsync(
       `SELECT so.*, u.full_name as created_by_name, m.full_name as approved_by_name 
        FROM stock_opnames so 
        LEFT JOIN users u ON so.user_id = u.id 
        LEFT JOIN users m ON so.manager_id = m.id 
-       ORDER BY so.opname_date DESC LIMIT 20`
+       WHERE so.outlet_id = ?
+       ORDER BY so.opname_date DESC LIMIT 20`,
+      [req.outletId]
     );
     res.json({ opnames });
   } catch (err) {

@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { db } = require('../db');
-const { authenticateToken, requireRole } = require('../auth');
+const { authenticateToken } = require('../auth');
+const { requirePermission } = require('../services/rbac');
 
 // GET /api/audit (Immutable Audit Logs)
-router.get('/', authenticateToken, requireRole(['owner', 'manager']), async (req, res) => {
+router.get('/', authenticateToken, requirePermission('audit.view'), async (req, res) => {
   try {
     const { action, limit = 50 } = req.query;
     let query = `

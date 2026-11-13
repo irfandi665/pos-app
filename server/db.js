@@ -117,6 +117,35 @@ async function initDb() {
     );
   `);
 
+  // A user may be authorized for several outlets, with one primary outlet.
+  // users.outlet_id is kept as the primary outlet for fast lookups.
+  await db.runAsync(`
+    CREATE TABLE IF NOT EXISTS user_outlets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      outlet_id INTEGER NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+      is_primary INTEGER NOT NULL DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, outlet_id)
+    );
+  `);
+
+  await db.runAsync(`
+    CREATE INDEX IF NOT EXISTS idx_user_outlets_user
+    ON user_outlets(user_id);
+  `);
+
+  await db.runAsync(`
+    CREATE INDEX IF NOT EXISTS idx_user_outlets_outlet
+    ON user_outlets(outlet_id);
+  `);
+
+  // Backfill grants for accounts created before multi-outlet support.
+  await db.runAsync(`
+    INSERT OR IGNORE INTO user_outlets (user_id, outlet_id, is_primary)
+    SELECT id, outlet_id, 1 FROM users WHERE outlet_id IS NOT NULL;
+  `);
+
   await db.runAsync(`
     CREATE TABLE IF NOT EXISTS categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

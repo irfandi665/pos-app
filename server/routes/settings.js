@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { db } = require('../db');
-const { authenticateToken, requireRole, recordAuditLog } = require('../auth');
+const { authenticateToken, recordAuditLog } = require('../auth');
+const { requirePermission } = require('../services/rbac');
 
 // GET /api/settings
 router.get('/', authenticateToken, async (req, res) => {
@@ -18,7 +19,7 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 // PUT /api/settings
-router.put('/', authenticateToken, requireRole(['owner']), async (req, res) => {
+router.put('/', authenticateToken, requirePermission('settings.manage'), async (req, res) => {
   try {
     const newSettings = req.body;
     for (const [key, value] of Object.entries(newSettings)) {

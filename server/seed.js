@@ -51,6 +51,12 @@ async function seed() {
     console.log('Created default users: owner, manager, kasir');
   }
 
+  // Ensure every account has at least its primary outlet grant.
+  await db.runAsync(`
+    INSERT OR IGNORE INTO user_outlets (user_id, outlet_id, is_primary)
+    SELECT id, outlet_id, 1 FROM users WHERE outlet_id IS NOT NULL;
+  `);
+
   // Settings
   const settingsList = [
     ['store_name', 'Toko Berkah Mandiri', 'Nama toko yang tercetak di struk'],

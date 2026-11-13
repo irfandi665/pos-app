@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const { db, withTransaction } = require('../db');
 const { authenticateToken, recordAuditLog } = require('../auth');
+const { resolveOutletContext } = require('../services/outlets');
 const { calculateCart } = require('../services/cart');
 const { InventoryError, deductStock } = require('../services/inventory');
 const {
@@ -264,7 +265,7 @@ async function expireQrisPayment({
 }
 
 // POST /api/qris/generate (Generate Dynamic QRIS for POS cart)
-router.post('/generate', authenticateToken, async (req, res) => {
+router.post('/generate', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const {
       items,
@@ -281,8 +282,8 @@ router.post('/generate', authenticateToken, async (req, res) => {
     }
 
     const activeShift = await db.getAsync(
-      'SELECT id FROM shifts WHERE user_id = ? AND status = "open"',
-      [req.user.id]
+      'SELECT id FROM shifts WHERE user_id = ? AND outlet_id = ? AND status = "open"',
+      [req.user.id, req.outletId]
     );
 
     if (!activeShift) {
@@ -300,8 +301,8 @@ router.post('/generate', authenticateToken, async (req, res) => {
 
     const placeholders = uniqueProductIds.map(() => '?').join(',');
     const products = await db.allAsync(
-      `SELECT * FROM products WHERE id IN (${placeholders}) AND is_active = 1`,
-      uniqueProductIds
+      `SELECT * FROM products WHERE id IN (${placeholders}) AND is_active = 1 AND outlet_id = ?`,
+      [...uniqueProductIds, req.outletId]
     );
     const productMap = new Map(products.map((product) => [product.id, product]));
 
@@ -363,7 +364,7 @@ router.post('/generate', authenticateToken, async (req, res) => {
       }
     });
 
-    const outletId = req.user.outlet_id || 1;
+    const outletId = req.outletId;
 
     await withTransaction(async () => {
       await db.runAsync(

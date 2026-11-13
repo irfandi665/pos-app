@@ -2,18 +2,19 @@ const express = require('express');
 const router = express.Router();
 const { db } = require('../db');
 const { authenticateToken, verifyManagerPin, recordAuditLog } = require('../auth');
+const { resolveOutletContext } = require('../services/outlets');
 
 // GET /api/shifts/current (Active cashier shift details & live cash calculations)
-router.get('/current', authenticateToken, async (req, res) => {
+router.get('/current', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const shift = await db.getAsync(
       `SELECT s.*, u.full_name as cashier_name, out.name as outlet_name 
        FROM shifts s 
        JOIN users u ON s.user_id = u.id 
        JOIN outlets out ON s.outlet_id = out.id 
-       WHERE s.user_id = ? AND s.status = 'open' 
+       WHERE s.user_id = ? AND s.outlet_id = ? AND s.status = 'open' 
        ORDER BY s.id DESC LIMIT 1`,
-      [req.user.id]
+      [req.user.id, req.outletId]
     );
 
     if (!shift) {
@@ -84,7 +85,7 @@ router.get('/current', authenticateToken, async (req, res) => {
 });
 
 // POST /api/shifts/open (Open cashier shift with cash float)
-router.post('/open', authenticateToken, async (req, res) => {
+router.post('/open', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const { starting_cash = 0 } = req.body;
 
@@ -103,7 +104,7 @@ router.post('/open', authenticateToken, async (req, res) => {
     const result = await db.runAsync(
       `INSERT INTO shifts (outlet_id, user_id, starting_cash, expected_cash, status) 
        VALUES (?, ?, ?, ?, 'open')`,
-      [req.user.outlet_id || 1, req.user.id, startCash, startCash]
+      [req.outletId, req.user.id, startCash, startCash]
     );
 
     await recordAuditLog(
@@ -264,14 +265,16 @@ router.post('/close', authenticateToken, async (req, res) => {
 });
 
 // GET /api/shifts/history
-router.get('/history', authenticateToken, async (req, res) => {
+router.get('/history', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const shifts = await db.allAsync(
       `SELECT s.*, u.full_name as cashier_name, m.full_name as manager_name 
        FROM shifts s 
        JOIN users u ON s.user_id = u.id 
        LEFT JOIN users m ON s.manager_approved_by = m.id 
-       ORDER BY s.id DESC LIMIT 30`
+       WHERE s.outlet_id = ?
+       ORDER BY s.id DESC LIMIT 30`,
+      [req.outletId]
     );
     res.json({ shifts });
   } catch (err) {

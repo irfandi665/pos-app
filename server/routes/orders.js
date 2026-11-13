@@ -5,6 +5,7 @@ const { db, withTransaction } = require('../db');
 const { authenticateToken, verifyManagerPin, recordAuditLog } = require('../auth');
 const { calculateCart, validatePayments } = require('../services/cart');
 const { InventoryError, deductStock, restoreStock } = require('../services/inventory');
+const { resolveOutletContext } = require('../services/outlets');
 
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const REFUND_METHODS = new Set(['cash', 'card', 'qris', 'split']);
@@ -65,7 +66,7 @@ function calculateRefundAmount(order, orderItem, quantity) {
 }
 
 // POST /api/orders (Process Cash, Card, or Split Checkout)
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, resolveOutletContext, async (req, res) => {
   let idempotencyKey = null;
   try {
     const {
@@ -106,10 +107,10 @@ router.post('/', authenticateToken, async (req, res) => {
       }
     }
 
-    // Verify open shift
+    // Verify open shift for the active outlet
     const activeShift = await db.getAsync(
-      'SELECT id FROM shifts WHERE user_id = ? AND status = "open"',
-      [req.user.id]
+      'SELECT id FROM shifts WHERE user_id = ? AND outlet_id = ? AND status = "open"',
+      [req.user.id, req.outletId]
     );
 
     if (!activeShift) {
@@ -131,8 +132,8 @@ router.post('/', authenticateToken, async (req, res) => {
     const uniqueProductIds = [...new Set(productIds)];
     const placeholders = uniqueProductIds.map(() => '?').join(',');
     const products = await db.allAsync(
-      `SELECT * FROM products WHERE id IN (${placeholders}) AND is_active = 1`,
-      uniqueProductIds
+      `SELECT * FROM products WHERE id IN (${placeholders}) AND is_active = 1 AND outlet_id = ?`,
+      [...uniqueProductIds, req.outletId]
     );
     const productMap = new Map(products.map((product) => [product.id, product]));
 
@@ -166,7 +167,7 @@ router.post('/', authenticateToken, async (req, res) => {
     });
     const paymentSummary = validatePayments(cart.total_amount, payments, payment_method);
     const orderId = generateOrderId();
-    const outletId = req.user.outlet_id || 1;
+    const outletId = req.outletId;
 
     await withTransaction(async () => {
       await db.runAsync(
@@ -300,7 +301,7 @@ router.post('/', authenticateToken, async (req, res) => {
 });
 
 // GET /api/orders (Recent orders)
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const { limit = 30, status } = req.query;
     let query = `
@@ -309,9 +310,9 @@ router.get('/', authenticateToken, async (req, res) => {
       FROM orders o 
       LEFT JOIN users u ON o.cashier_id = u.id 
       LEFT JOIN customers c ON o.customer_id = c.id 
-      WHERE o.status != 'held'
+      WHERE o.status != 'held' AND o.outlet_id = ?
     `;
-    const params = [];
+    const params = [req.outletId];
 
     if (status) {
       query += ` AND o.status = ?`;
@@ -329,7 +330,7 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 // GET /api/orders/:id (Detailed order for receipt)
-router.get('/:id', authenticateToken, async (req, res) => {
+router.get('/:id', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const order = await db.getAsync(
       `SELECT o.*, u.full_name as cashier_name, c.name as customer_name, c.phone as customer_phone,
@@ -338,8 +339,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
        LEFT JOIN users u ON o.cashier_id = u.id 
        LEFT JOIN customers c ON o.customer_id = c.id 
        LEFT JOIN outlets out ON o.outlet_id = out.id 
-       WHERE o.id = ?`,
-      [req.params.id]
+       WHERE o.id = ? AND o.outlet_id = ?`,
+      [req.params.id, req.outletId]
     );
 
     if (!order) return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
@@ -369,7 +370,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
 });
 
 // POST /api/orders/hold (Save Bill)
-router.post('/hold', authenticateToken, async (req, res) => {
+router.post('/hold', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const { items, held_name, notes, discount_amount = 0, tax_rate = 0, customer_id = null } = req.body;
     if (!items || items.length === 0) {
@@ -392,7 +393,7 @@ router.post('/hold', authenticateToken, async (req, res) => {
        VALUES (?, ?, ?, ?, 'held', ?, ?, ?, ?, ?, 'cash', ?, ?)`,
       [
         orderId,
-        req.user.outlet_id || 1,
+        req.outletId,
         req.user.id,
         customer_id || null,
         subtotal,
@@ -430,15 +431,16 @@ router.post('/hold', authenticateToken, async (req, res) => {
 });
 
 // GET /api/orders/held/list
-router.get('/held/list', authenticateToken, async (req, res) => {
+router.get('/held/list', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const heldOrders = await db.allAsync(
       `SELECT o.*, u.full_name as cashier_name,
         (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count
        FROM orders o 
        LEFT JOIN users u ON o.cashier_id = u.id 
-       WHERE o.status = 'held' 
-       ORDER BY o.created_at DESC`
+       WHERE o.status = 'held' AND o.outlet_id = ?
+       ORDER BY o.created_at DESC`,
+      [req.outletId]
     );
 
     // Fetch items for each held order
@@ -453,9 +455,17 @@ router.get('/held/list', authenticateToken, async (req, res) => {
 });
 
 // DELETE /api/orders/held/:id
-router.delete('/held/:id', authenticateToken, async (req, res) => {
+router.delete('/held/:id', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
     const id = req.params.id;
+    const heldOrder = await db.getAsync(
+      'SELECT id, outlet_id FROM orders WHERE id = ? AND status = "held"',
+      [id]
+    );
+    if (!heldOrder) return res.status(404).json({ error: 'Pesanan tertahan tidak ditemukan' });
+    if (heldOrder.outlet_id && heldOrder.outlet_id !== req.outletId) {
+      return res.status(403).json({ error: 'Pesanan milik outlet lain', code: 'OUTLET_FORBIDDEN' });
+    }
     await db.runAsync('DELETE FROM order_items WHERE order_id = ?', [id]);
     await db.runAsync('DELETE FROM orders WHERE id = ? AND status = "held"', [id]);
     res.json({ success: true, message: 'Pesanan tertahan dihapus' });
@@ -465,7 +475,7 @@ router.delete('/held/:id', authenticateToken, async (req, res) => {
 });
 
 // POST /api/orders/:id/void (Void transaction with Manager PIN authorization)
-router.post('/:id/void', authenticateToken, verifyManagerPin, async (req, res) => {
+router.post('/:id/void', authenticateToken, verifyManagerPin, resolveOutletContext, async (req, res) => {
   try {
     const orderId = req.params.id;
     const { reason } = req.body;
@@ -476,6 +486,9 @@ router.post('/:id/void', authenticateToken, verifyManagerPin, async (req, res) =
 
     const order = await db.getAsync('SELECT * FROM orders WHERE id = ?', [orderId]);
     if (!order) return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
+    if (order.outlet_id && order.outlet_id !== req.outletId) {
+      return res.status(403).json({ error: 'Transaksi milik outlet lain', code: 'OUTLET_FORBIDDEN' });
+    }
 
     if (order.status === 'voided') {
       return res.status(400).json({ error: 'Transaksi ini sudah pernah dibatalkan (voided)' });
@@ -539,7 +552,7 @@ router.post('/:id/void', authenticateToken, verifyManagerPin, async (req, res) =
 });
 
 // POST /api/orders/:id/return (Process product return with Manager PIN)
-router.post('/:id/return', authenticateToken, verifyManagerPin, async (req, res) => {
+router.post('/:id/return', authenticateToken, verifyManagerPin, resolveOutletContext, async (req, res) => {
   try {
     const orderId = req.params.id;
     const {
@@ -564,6 +577,9 @@ router.post('/:id/return', authenticateToken, verifyManagerPin, async (req, res)
 
     const order = await db.getAsync('SELECT * FROM orders WHERE id = ?', [orderId]);
     if (!order) return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
+    if (order.outlet_id && order.outlet_id !== req.outletId) {
+      return res.status(403).json({ error: 'Transaksi milik outlet lain', code: 'OUTLET_FORBIDDEN' });
+    }
     if (order.status !== 'paid') {
       return res.status(400).json({
         error: `Hanya transaksi berstatus lunas yang dapat diretur (status saat ini: ${order.status})`
@@ -706,12 +722,15 @@ router.post('/:id/return', authenticateToken, verifyManagerPin, async (req, res)
 });
 
 // GET /api/orders/:id/returns (Refund and return ledger for an order)
-router.get('/:id/returns', authenticateToken, async (req, res) => {
+router.get('/:id/returns', authenticateToken, resolveOutletContext, async (req, res) => {
   try {
-    const order = await db.getAsync('SELECT id, total_amount FROM orders WHERE id = ?', [
+    const order = await db.getAsync('SELECT id, total_amount, outlet_id FROM orders WHERE id = ?', [
       req.params.id
     ]);
     if (!order) return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
+    if (order.outlet_id && order.outlet_id !== req.outletId) {
+      return res.status(403).json({ error: 'Transaksi milik outlet lain', code: 'OUTLET_FORBIDDEN' });
+    }
 
     const returns = await db.allAsync(
       `SELECT r.*, u.full_name AS approved_by_name
